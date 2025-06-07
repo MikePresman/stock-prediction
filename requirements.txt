@@ -1,0 +1,6 @@
+snscrape
+textblob
+pandas
+openpyxl
+playwright
+openai 
