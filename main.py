@@ -6,7 +6,8 @@ import json
 from playwright.sync_api import sync_playwright
 from openai import OpenAI
 
-client = OpenAI()
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 EXCEL_FILE = "prediction_history.xlsx"
 TODAY = datetime.date.today()

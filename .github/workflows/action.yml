@@ -24,10 +24,13 @@ jobs:
           pip install -r requirements.txt
           playwright install
 
+      
       - name: Run prediction script
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python main.py
+        run: |
+          export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          python main.py
 
       - name: Send SMS notification with Twilio
         env:
