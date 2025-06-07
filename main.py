@@ -1,15 +1,13 @@
 import os
 import datetime
 import pandas as pd
+import yfinance as yf
 import json
-import openai
 from playwright.sync_api import sync_playwright
-
 from openai import OpenAI
-client = OpenAI()  # Uses OPENAI_API_KEY from env
 
-# === CONFIGURATION ===
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Load from env var for safety
+client = OpenAI()
+
 EXCEL_FILE = "prediction_history.xlsx"
 TODAY = datetime.date.today()
 REAL_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
@@ -18,14 +16,18 @@ USERS = {
     "realDonaldTrump": "https://x.com/realDonaldTrump",
 }
 
-SIMULATED_PRICES = {
-    "TSLA": 180.0, "F": 12.4, "XOM": 105.0, "GM": 45.0, "RIVN": 11.3,
-    "NVDA": 130.0, "MSFT": 420.0, "GOOGL": 175.0, "DJT": 35.0,
-}
+def get_current_price(ticker):
+    try:
+        current_data = yf.Ticker(ticker).history(period="1d")
+        if not current_data.empty:
+            return round(current_data["Close"].iloc[-1], 2)
+    except Exception as e:
+        print(f"⚠️ Error fetching price for {ticker}: {e}")
+    return None
 
 def scrape_tweets(url, max_count=5):
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(user_agent=REAL_USER_AGENT)
         page = context.new_page()
 
@@ -48,6 +50,62 @@ def scrape_tweets(url, max_count=5):
         browser.close()
         return tweets
 
+def evaluate_past_performance():
+    if not os.path.exists(EXCEL_FILE):
+        return None
+
+    df = pd.read_excel(EXCEL_FILE)
+    df = df[df['ticker'] != "EVALUATION"]
+    if df.empty:
+        return None
+
+    df = df.sort_values(by="date", ascending=False)
+    recent = df.head(50)
+    if recent.empty:
+        return None
+
+    evaluation_notes = []
+    correct_count = 0
+    total_count = 0
+
+    for _, row in recent.iterrows():
+        ticker = row["ticker"]
+        original_price = row["price"]
+        action = row["action"]
+
+        latest_price = get_current_price(ticker)
+        if latest_price is None:
+            evaluation_notes.append(f"⚠️ Could not fetch data for {ticker}.")
+            continue
+
+        total_count += 1
+        if action == "BUY" and latest_price > original_price:
+            correct_count += 1
+            evaluation_notes.append(f"✅ BUY {ticker} was good. {original_price} → {latest_price:.2f}")
+        elif action == "SELL" and latest_price < original_price:
+            correct_count += 1
+            evaluation_notes.append(f"✅ SELL {ticker} was good. {original_price} → {latest_price:.2f}")
+        else:
+            evaluation_notes.append(f"❌ {action} {ticker} was bad. {original_price} → {latest_price:.2f}")
+
+    accuracy = round(100 * correct_count / total_count, 2) if total_count > 0 else 0.0
+    summary = f"Evaluated {total_count} recent predictions: {correct_count} correct ({accuracy}%)."
+
+    summary_row = {
+        "ticker": "EVALUATION",
+        "action": "SUMMARY",
+        "sentiment": accuracy,
+        "price": 0,
+        "date": TODAY,
+        "reason": summary + "\n" + "\n".join(evaluation_notes[:5])
+    }
+
+    df_all = pd.read_excel(EXCEL_FILE)
+    df_all = pd.concat([df_all, pd.DataFrame([summary_row])], ignore_index=True)
+    df_all.to_excel(EXCEL_FILE, index=False)
+
+    return summary + "\nUse this evaluation to improve today's predictions."
+
 def get_feud_summary(elon_tweets, trump_tweets):
     prompt = f"""
 Elon Musk and Donald Trump posted these tweets today:
@@ -69,22 +127,23 @@ Summarize the main conflict or debate between them in 1-2 sentences.
     )
     return res.choices[0].message.content.strip()
 
-def get_stock_predictions_from_summary(summary):
-    prompt = f"""
-Given this feud summary:
-\"\"\"{summary}\"\"\"
-
-Suggest 2-3 publicly traded companies whose stock might be impacted.
-For each, explain briefly why and suggest BUY, SELL, or HOLD.
-Respond in JSON format like:
-[
-  {{
-    "ticker": "TSLA",
-    "action": "BUY",
-    "reason": "Elon is defending EVs while Trump criticizes them, increasing attention on Tesla."
-  }}
-]
-"""
+def get_stock_predictions_from_summary(summary, evaluation_context):
+    prompt = (
+        "Based on the following recent performance summary:\n"
+        f"{evaluation_context}\n\n"
+        "And this feud summary:\n"
+        f"{summary}\n\n"
+        "Suggest 2-3 publicly traded companies whose stock might be impacted.\n"
+        "For each, explain briefly why and suggest BUY, SELL, or HOLD.\n"
+        "Respond in JSON format like:\n"
+        "[\n"
+        "  {\n"
+        "    \"ticker\": \"TSLA\",\n"
+        "    \"action\": \"BUY\",\n"
+        "    \"reason\": \"Elon is defending EVs while Trump criticizes them, increasing attention on Tesla.\"\n"
+        "  }\n"
+        "]"
+    )
     res = client.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -98,39 +157,46 @@ Respond in JSON format like:
         print("❌ Error parsing GPT response:", e)
         return []
 
-def update_excel(predictions):
-    df_today = pd.DataFrame(predictions)
+def log_today_predictions(predictions):
+    rows = []
+    for p in predictions:
+        current_price = get_current_price(p["ticker"])
+        rows.append({
+            "ticker": p["ticker"],
+            "action": p["action"],
+            "sentiment": p.get("sentiment", "n/a"),
+            "price": current_price or 0,
+            "date": TODAY,
+            "reason": p.get("reason", "")
+        })
+
     if os.path.exists(EXCEL_FILE):
         df_history = pd.read_excel(EXCEL_FILE)
-        df_combined = pd.concat([df_history, df_today], ignore_index=True)
+        df_combined = pd.concat([df_history, pd.DataFrame(rows)], ignore_index=True)
     else:
-        df_combined = df_today
+        df_combined = pd.DataFrame(rows)
+
     df_combined.to_excel(EXCEL_FILE, index=False)
-    print(f"✅ Logged {len(predictions)} predictions to {EXCEL_FILE}.")
+    print(f"✅ Logged {len(rows)} predictions to {EXCEL_FILE}.")
 
 def main():
+    evaluation_summary = evaluate_past_performance() or "No past performance available."
+
     all_tweets = {}
     for name, url in USERS.items():
         print(f"Scraping tweets from {name}...")
         tweets = scrape_tweets(url)
         all_tweets[name] = tweets
 
-    summary = get_feud_summary(all_tweets["elonmusk"], all_tweets["realDonaldTrump"])
-    print("\n📄 Feud Summary:", summary)
+    feud_summary = get_feud_summary(all_tweets.get("elonmusk", []), all_tweets.get("realDonaldTrump", []))
+    print("\n📄 Feud Summary:\n", feud_summary)
 
-    predictions = get_stock_predictions_from_summary(summary)
+    predictions = get_stock_predictions_from_summary(feud_summary, evaluation_summary)
     print("\n📈 Predictions:")
     for p in predictions:
         print(f"  {p['ticker']} - {p['action']} ({p['reason']})")
 
-    # Add extra fields
-    for p in predictions:
-        p["price"] = SIMULATED_PRICES.get(p["ticker"], 0.0)
-        p["sentiment"] = "n/a"
-        p["date"] = TODAY
-
-    update_excel(predictions)
+    log_today_predictions(predictions)
 
 if __name__ == "__main__":
     main()
-
