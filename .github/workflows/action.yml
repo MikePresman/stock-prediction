@@ -2,7 +2,7 @@ name: Nightly Elon-vs-Trump Stock Predictor
 
 on:
   schedule:
-    - cron: '0 18 * * *'  # Runs daily at 6 PM EST
+    - cron: '0 22 * * *'  # Runs daily at 6 PM EST
   workflow_dispatch:
 
 permissions:
